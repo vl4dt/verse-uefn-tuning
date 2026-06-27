@@ -75,6 +75,9 @@ task_counter_lock = threading.Lock()
 task_id_counter = 0
 total_completed = 0
 pending_count = 0
+# Task timing: maps task_id -> {"start": ts, "rate": samples/sec}
+task_timing_lock = threading.Lock()
+task_timings: dict[int, dict] = {}
 debug_log_lock = threading.Lock()
 
 
@@ -520,6 +523,8 @@ def make_task(seeds: list[dict], temps: list[float]) -> tuple[str, list[dict]]:
     with task_counter_lock:
         task_id_counter += 1
         tid = task_id_counter
+    with task_timing_lock:
+        task_timings[tid] = {"start": time.time(), "label": "pending"}
 
     roll = random.random()
     if roll < 0.40:
@@ -546,6 +551,15 @@ def make_task(seeds: list[dict], temps: list[float]) -> tuple[str, list[dict]]:
 
     elapsed = time.time() - start
     count = len(samples) if samples else 0
+    rate = count / elapsed if elapsed > 0 else 0
+    with task_timing_lock:
+        task_timings[tid] = {
+            "start": start,
+            "label": label,
+            "elapsed": elapsed,
+            "count": count,
+            "rate": rate,  # samples/sec for this task
+        }
     status = f"+{count}" if count > 0 else "+0 (FAILED)"
     p(f"[{time.strftime('%H:%M:%S')}] #{tid:>3} DONE  [{label:<20s}] t={temp} "
       f"| {elapsed:6.1f}s | {status}")
@@ -636,6 +650,7 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
     # Start time
     start_time = time.time()
     strategy_counts = {"self_instruct": 0, "evol_instruct": 0, "nl_to_code": 0, "code_to_explanation": 0}
+    in_flight_task_ids = set()
 
     p(f"\nStarting generation... (Ctrl+C to stop and save)\n")
     dlog(f"=== RUN START === target={target} workers={workers} temps={temps} resume={resume}")
@@ -652,7 +667,7 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
             while (len(all_samples) + pending_count < target
                    and len(futures) < workers):
                 future = executor.submit(make_task, seeds, temps)
-                futures[future] = None
+                futures[future] = task_id_counter  # track which task this is
                 pending_count += 1
 
             # Wait for at least one task to complete
@@ -672,7 +687,9 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
                 samples = []
                 label = "error"
 
-            del futures[finished_future]
+            finished_future_tid = futures.pop(finished_future, None)
+            if finished_future_tid is not None:
+                in_flight_task_ids.discard(finished_future_tid)
             pending_count -= 1
 
             count = len(samples) if samples else 0
@@ -684,9 +701,23 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
                 # Save checkpoint immediately after every batch
                 save_samples(samples, OUTPUT_FILE)
 
-            # Always show progress (even when +0 so we can diagnose failures)
+            # ETA: use recent task rates + in-flight work estimate
             elapsed = time.time() - start_time
             rate_per_sec = total_completed / elapsed if elapsed > 0 else 0
+
+            # Estimate samples from in-flight tasks using their recorded rates
+            now = time.time()
+            inflight_estimate = 0.0
+            with task_timing_lock:
+                for tid_key, info in list(task_timings.items()):
+                    if tid_key not in in_flight_task_ids:
+                        continue
+                    start_ts = info["start"]
+                    elapsed_now = now - start_ts
+                    rate = info.get("rate", 0.1)  # fallback low rate
+                    inflight_estimate += rate * elapsed_now
+
+            effective_completed = total_completed + inflight_estimate
             remaining = max(target - len(all_samples), 0)
             eta_secs = remaining / rate_per_sec if rate_per_sec > 0 else float('inf')
 
