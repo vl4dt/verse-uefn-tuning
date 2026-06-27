@@ -735,6 +735,30 @@ def _check_hf_connectivity() -> bool:
         return False
 
 
+def _select_backend(args) -> tuple[Backend, str]:
+    """Determine which backend to use based on --backend flag or auto-detection."""
+    if hasattr(args, "backend") and args.backend:
+        backend_name = args.backend.lower()
+        p(f"Using explicit backend: {backend_name}")
+        if backend_name == "huggingface":
+            return HuggingFaceBackend(), "huggingface"
+        elif backend_name in ("llama-server", "local"):
+            return LlamaServerBackend(), "llama-server"
+        else:
+            p(f"ERROR: Unknown backend '{backend_name}'. Use 'llama-server' or 'huggingface'.",
+              file=sys.stderr)
+            sys.exit(1)
+
+    # Auto-detect: prefer llama-server if available, otherwise HF
+    if Path(MODEL_UD).exists() or Path(MODEL_Q4).exists():
+        p("Auto-detected: local model found, using llama-server backend")
+        return LlamaServerBackend(), "llama-server"
+    else:
+        p("No local model found. Falling back to HuggingFace Serverless API.")
+        p("Set HF_TOKEN env var for higher rate limits, or run locally with a GGUF model.")
+        return HuggingFaceBackend(), "huggingface"
+
+
 def main():
     global total_completed, pending_count, shutdown_requested, executor_shutting_down
 
