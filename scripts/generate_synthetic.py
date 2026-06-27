@@ -693,6 +693,14 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
             pending_count -= 1
 
             count = len(samples) if samples else 0
+            task_rate = (task_timings.get(finished_future_tid, {}).get("rate", 0.0)
+                         if finished_future_tid is not None else 0.0)
+            with task_timing_lock:
+                rates_history.append(task_rate)
+                # Keep last ~200 entries to bound memory for long runs
+                while len(rates_history) > 200:
+                    rates_history.pop(0)
+
             if samples:
                 all_samples.extend(samples)
                 strategy_counts[label] += count
@@ -701,25 +709,25 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
                 # Save checkpoint immediately after every batch
                 save_samples(samples, OUTPUT_FILE)
 
-            # ETA: use recent task rates + in-flight work estimate
+            # ETA: account for parallel workers + in-flight work
             elapsed = time.time() - start_time
-            rate_per_sec = total_completed / elapsed if elapsed > 0 else 0
+            num_in_flight = len(in_flight_task_ids)
 
-            # Estimate samples from in-flight tasks using their recorded rates
-            now = time.time()
-            inflight_estimate = 0.0
-            with task_timing_lock:
-                for tid_key, info in list(task_timings.items()):
-                    if tid_key not in in_flight_task_ids:
-                        continue
-                    start_ts = info["start"]
-                    elapsed_now = now - start_ts
-                    rate = info.get("rate", 0.1)  # fallback low rate
-                    inflight_estimate += rate * elapsed_now
+            # Compute average samples-per-batch from recently completed tasks
+            recent_rates = rates_history[-20:]  # last ~20 task completions
+            if recent_rates:
+                avg_samples_per_batch = sum(recent_rates) / len(recent_rates)
+            else:
+                avg_samples_per_batch = 1.0  # fallback: assume 1 sample per batch
 
-            effective_completed = total_completed + inflight_estimate
+            # Effective throughput: completed rate + in-flight contribution
+            # (each in-flight task is expected to produce ~avg_samples_per_batch more)
+            completed_rate = total_completed / elapsed if elapsed > 0 else 0
+            inflight_contribution = num_in_flight * avg_samples_per_batch / max(elapsed, 1.0)
+            effective_rate = completed_rate + inflight_contribution
+
             remaining = max(target - len(all_samples), 0)
-            eta_secs = remaining / rate_per_sec if rate_per_sec > 0 else float('inf')
+            eta_secs = remaining / effective_rate if effective_rate > 0 else float('inf')
 
             if eta_secs < 60:
                 eta_str = f"{eta_secs:.0f}s"
@@ -732,7 +740,7 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
 
             temp_val = samples[0].get("temperature", "?") if samples else "?"
             p(f"[{time.strftime('%H:%M:%S')}] +{count:>2} [{label:<20s}] t={temp_val} | "
-              f"{len(all_samples)}/{target} | {rate_per_sec:.2f}/s | ETA {eta_str}")
+              f"{len(all_samples)}/{target} | {effective_rate:.2f}/s ({num_in_flight} in-flight) | ETA {eta_str}")
 
     # Shutdown handling
     elapsed = time.time() - start_time
