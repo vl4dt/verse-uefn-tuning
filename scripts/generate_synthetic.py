@@ -29,8 +29,28 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
-# Paths — override via env vars or CLI args (Colab-friendly defaults)
-DEFAULT_LLAMA_SERVER = "./llama.cpp/build/bin/llama-server"  # Colab build location
+# Path resolution: check multiple locations for llama-server and model files
+def _resolve_path(*candidates: str) -> str:
+    """Return first existing path from candidates."""
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    # Last candidate is the fallback (will cause clear error if missing)
+    return candidates[-1]
+
+
+def _find_llama_server() -> str:
+    """Search common locations for llama-server binary."""
+    candidates = [
+        os.environ.get("LLAMA_SERVER", ""),  # explicit override
+        "./llama.cpp/build/bin/llama-server",
+        "/home/vl4dt/LLM-AI-Tooling/llama.cpp/build/bin/llama-server",
+        os.path.expanduser("~/LLM-AI-Tooling/llama.cpp/build/bin/llama-server"),
+    ]
+    return _resolve_path(*[c for c in candidates if c])
+
+
+DEFAULT_LLAMA_SERVER = _find_llama_server()
 LLAMA_SERVER = os.environ.get("LLAMA_SERVER", DEFAULT_LLAMA_SERVER)
 HF_CACHE = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 MODEL_Q4 = os.environ.get(
