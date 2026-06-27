@@ -1,35 +1,30 @@
 #!/bin/bash
 # ============================================================
 # setup_colab.sh — Build llama.cpp + download Qwen3.6-27B model
-# Works on Google Colab (T4 / A100 / L4) with GPU runtime enabled
+# Specifically designed for Google Colab environment
+# Uses conda-based CUDA installation (more reliable than apt)
 # ============================================================
 set -e
 
-echo "=== Step 1: Install CUDA toolkit ==="
-if ! dpkg -l | grep -q cuda-cudart-dev; then
-    echo "Installing CUDA toolkit..."
-    # Add NVIDIA package repo (Colab uses Ubuntu 20.04/22.04)
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+echo "=== Step 1: Install CUDA toolkit via conda ==="
+if ! command -v nvcc &> /dev/null; then
+    echo "Installing Miniconda..."
+    wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
+    bash miniconda.sh -b -p $HOME/miniconda
+    export PATH="$HOME/miniconda/bin:$PATH"
     
-    # Detect GPU and install appropriate CUDA version
-    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+    echo "Installing CUDA toolkit via conda..."
+    conda install -y -c nvidia cuda-toolkit=12.4 cuda-cccl=12.4
     
-    # Use latest stable CUDA (works on Colab)
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
-        git \
-        wget \
-        unzip \
-        libcuda1-dev \
-        cuda-cudart-dev \
-        libcublas-dev \
-        libcufft-dev
-    
-    echo "CUDA toolkit installed: $(nvcc --version 2>/dev/null | tail -1)"
+    # Verify installation
+    if command -v nvcc &> /dev/null; then
+        echo "CUDA installed: $(nvcc --version 2>/dev/null | tail -1)"
+    else
+        echo "ERROR: CUDA installation failed"
+        exit 1
+    fi
 else
-    echo "CUDA toolkit already installed."
+    echo "CUDA already installed."
 fi
 
 echo ""
@@ -39,11 +34,11 @@ if [ ! -d "llama.cpp" ]; then
 fi
 
 cd llama.cpp
+export PATH="$HOME/miniconda/bin:$PATH"
 export CUDACXX=$(which nvcc)
 cmake -B build \
     -DGGML_CUDA=ON \
     -DLLAMA_SERVER=ON \
-    -DGGML_CUDA_MOCK=OFF \
     -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j$(nproc 2>/dev/null || nproc)
 
@@ -63,18 +58,19 @@ else
 fi
 
 echo ""
-echo "=== Step 4: Verify GPU ==="
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-echo ""
-
-# Auto-select quant based on VRAM
-TOTAL_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1 | tr -d ' MB' | cut -d. -f1)
-if [ "$TOTAL_VRAM" -ge 20000 ]; then
-    MODEL_FILE="models/Qwen3.6-27B-Q4_K_M.gguf"
-    echo "VRAM: ${TOTAL_VRAM}MB — using Q4_K_M (~18GB)"
+echo "=== Step 4: Verify setup ==="
+if command -v nvcc &> /dev/null; then
+    echo "CUDA: $(nvcc --version 2>/dev/null | tail -1)"
 else
-    MODEL_FILE="models/Qwen3.6-27B-Q4_K_M.gguf"
-    echo "VRAM: ${TOTAL_VRAM}MB — using Q4_K_M (tight fit, may use CPU offload)"
+    echo "WARNING: CUDA not found in PATH after build"
+fi
+
+# Check VRAM if nvidia-smi is available
+if command -v nvidia-smi &> /dev/null; then
+    echo ""
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+else
+    echo "Note: nvidia-smi not available (expected in Colab container)"
 fi
 
 echo ""
@@ -83,9 +79,6 @@ echo ""
 echo "Run generation with:"
 echo "  python3 scripts/generate_synthetic.py \\"
 echo "    --llama-server llama.cpp/build/bin/llama-server \\"
-echo "    --model-q4 $MODEL_FILE \\"
+echo "    --model-q4 models/Qwen3.6-27B-Q4_K_M.gguf \\"
 echo "    --workers $(nproc 2>/dev/null || nproc) \\"
 echo "    --target-samples 5000"
-echo ""
-echo "To resume an interrupted run:"
-echo "  python3 scripts/generate_synthetic.py --resume"
