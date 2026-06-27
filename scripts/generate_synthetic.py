@@ -758,6 +758,7 @@ def main():
         MODEL_Q4 = args.model_q4
 
     # Select and initialize backend
+    global _backend_instance
     _backend_instance, backend_name = _select_backend(args)
     p(f"Backend: {backend_name}")
 
