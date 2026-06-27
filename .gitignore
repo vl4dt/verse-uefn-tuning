@@ -1,0 +1,22 @@
+# Agent / IDE config (not needed for data generation)
+.agents/
+.beads/
+.claude/
+.codex/
+
+# Raw repos — scraped into data/seeds/*.jsonl, not needed in repo
+data/repos/
+
+# Build artifacts
+__pycache__/
+*.pyc
+*.so
+build/
+dist/
+
+# llama.cpp build output (will be rebuilt on Colab)
+data/models/llama-server.log
+
+# OS files
+.DS_Store
+Thumbs.db

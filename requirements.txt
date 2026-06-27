@@ -1,0 +1,5 @@
+# Python dependencies (only what generate_synthetic.py needs)
+# It uses only stdlib, so no pip install required for generation.
+# For scraping/seeding scripts (already ran locally):
+beautifulsoup4>=4.12
+lxml>=5.0
