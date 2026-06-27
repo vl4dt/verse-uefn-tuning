@@ -2,7 +2,7 @@
 # ============================================================
 # setup_colab.sh — Build llama.cpp + download Qwen3.6-27B model
 # Specifically designed for Google Colab environment
-# Uses conda-based CUDA installation (more reliable than apt)
+# Uses conda-forge channel (no ToS issues)
 # ============================================================
 set -e
 
@@ -13,8 +13,17 @@ if ! command -v nvcc &> /dev/null; then
     bash miniconda.sh -b -p $HOME/miniconda
     export PATH="$HOME/miniconda/bin:$PATH"
     
-    echo "Installing CUDA toolkit via conda..."
-    conda install -y -c nvidia cuda-toolkit=12.4 cuda-cccl=12.4
+    echo "Accepting Conda Terms of Service..."
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r || true
+    
+    echo "Installing CUDA toolkit via conda-forge..."
+    # Use conda-forge (no ToS issues) + nvidia channel for CUDA packages
+    conda install -y -c conda-forge -c nvidia \
+        cuda-toolkit=12.4 \
+        cuda-cccl=12.4 \
+        cmake \
+        ninja
     
     # Verify installation
     if command -v nvcc &> /dev/null; then
@@ -63,14 +72,6 @@ if command -v nvcc &> /dev/null; then
     echo "CUDA: $(nvcc --version 2>/dev/null | tail -1)"
 else
     echo "WARNING: CUDA not found in PATH after build"
-fi
-
-# Check VRAM if nvidia-smi is available
-if command -v nvidia-smi &> /dev/null; then
-    echo ""
-    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-else
-    echo "Note: nvidia-smi not available (expected in Colab container)"
 fi
 
 echo ""
