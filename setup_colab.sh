@@ -9,9 +9,25 @@ set -e
 echo "=== Step 1: Install CUDA toolkit via conda ==="
 if ! command -v nvcc &> /dev/null; then
     echo "Installing Miniconda..."
-    wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-    bash miniconda.sh -b -p $HOME/miniconda
-    export PATH="$HOME/miniconda/bin:$PATH"
+    if [ ! -d "$HOME/miniconda3" ]; then
+        wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
+        bash miniconda.sh -b -p $HOME/miniconda3
+    else
+        echo "Miniconda already installed, reusing."
+    fi
+    
+    # Export conda to PATH (handle different install paths)
+    if [ -d "$HOME/miniconda3" ]; then
+        export PATH="$HOME/miniconda3/bin:$PATH"
+    elif [ -d "$HOME/miniconda" ]; then
+        export PATH="$HOME/miniconda/bin:$PATH"
+    fi
+    
+    # Initialize conda (required for some commands)
+    if ! command -v conda &> /dev/null; then
+        $HOME/miniconda3/bin/conda init bash || true 2>/dev/null
+    fi
+    export PATH="$HOME/miniconda3/bin:$PATH"
     
     echo "Accepting Conda Terms of Service..."
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true
@@ -43,7 +59,7 @@ if [ ! -d "llama.cpp" ]; then
 fi
 
 cd llama.cpp
-export PATH="$HOME/miniconda/bin:$PATH"
+export PATH="$HOME/miniconda3/bin:$PATH"
 export CUDACXX=$(which nvcc)
 cmake -B build \
     -DGGML_CUDA=ON \
@@ -80,6 +96,6 @@ echo ""
 echo "Run generation with:"
 echo "  python3 scripts/generate_synthetic.py \\"
 echo "    --llama-server llama.cpp/build/bin/llama-server \\"
-echo "    --model-q4 models/Qwen3.6-27B-Q4_K_M.gguf \\"
+echo "    --model-q4 models/Qwen3.6-27B-Q4_K_M.gguf \\\"
 echo "    --workers $(nproc 2>/dev/null || nproc) \\"
 echo "    --target-samples 5000"
