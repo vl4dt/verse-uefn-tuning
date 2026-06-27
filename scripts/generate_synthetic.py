@@ -78,6 +78,8 @@ pending_count = 0
 # Task timing: maps task_id -> {"start": ts, "rate": samples/sec}
 task_timing_lock = threading.Lock()
 task_timings: dict[int, dict] = {}
+# Recent per-task sample rates (samples/sec) for ETA estimation
+task_rate_history: list[float] = []
 debug_log_lock = threading.Lock()
 
 
@@ -696,10 +698,10 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
             task_rate = (task_timings.get(finished_future_tid, {}).get("rate", 0.0)
                          if finished_future_tid is not None else 0.0)
             with task_timing_lock:
-                rates_history.append(task_rate)
+                task_rate_history.append(task_rate)
                 # Keep last ~200 entries to bound memory for long runs
-                while len(rates_history) > 200:
-                    rates_history.pop(0)
+                while len(task_rate_history) > 200:
+                    task_rate_history.pop(0)
 
             if samples:
                 all_samples.extend(samples)
@@ -714,7 +716,7 @@ def _run_generation(target: int, temps: list[float], workers: int, resume: bool)
             num_in_flight = len(in_flight_task_ids)
 
             # Compute average samples-per-batch from recently completed tasks
-            recent_rates = rates_history[-20:]  # last ~20 task completions
+            recent_rates = task_rate_history[-20:]  # last ~20 task completions
             if recent_rates:
                 avg_samples_per_batch = sum(recent_rates) / len(recent_rates)
             else:
