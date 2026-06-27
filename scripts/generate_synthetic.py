@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Synthetic Verse data generation via llama.cpp server API.
+"""Synthetic Verse data generation.
 
-Starts and stops its own llama-server with matching --parallel/--workers.
-Uses unified seed data as few-shot context, then generates instruction-response
-pairs through four strategies: Self-Instruct, Evol-Instruct, NL-to-Code, and
-Code-to-Explanation.
+Supports two backends:
+  llama-server  – local llama.cpp (fastest, needs CUDA + compiled binary)
+  huggingface   – HF Serverless Inference API (free tier, no GPU needed)
+
+Auto-detects: if llama-server is available locally it uses that; otherwise
+falls back to HuggingFace. Override with --backend llama-server|huggingface.
 
 Usage:
+    # Local llama-server backend (fastest, needs CUDA + compiled binary):
     python3 scripts/generate_synthetic.py --target-samples 2000 --workers 4
+
+    # Colab / no-GPU (free tier HuggingFace API, Qwen2.5-72B-Instruct):
+    export HF_TOKEN="hf_..."          # optional, higher rate limit than anon
+    python3 scripts/generate_synthetic.py --target-samples 1000  # auto-detects HF
 
 Output: data/seeds/synthetic_raw.jsonl (Alpaca format)
 Checkpoint: saved after every batch so interrupted runs don't lose data.
@@ -24,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.request import urlopen, Request
@@ -116,75 +124,219 @@ def p(*args, **kwargs):
     print(*args, flush=True, **kwargs)
 
 
-# Server management
-
-_server_proc: subprocess.Popen | None = None
+# Backend abstraction (llama-server or HuggingFace Serverless API)
 
 
-def start_llama_server(host: str, port: int, parallel: int) -> subprocess.Popen:
-    """Start llama-server with MTP tuning matching Windows config."""
-    model = MODEL_UD if Path(MODEL_UD).exists() else MODEL_Q4
-    if not Path(model).exists():
-        p(f"ERROR: Model not found at {model}", file=sys.stderr)
+class Backend(ABC):
+    """Abstract inference backend. All backends expose a chat() method."""
+
+    @abstractmethod
+    def chat(self, messages: list[dict], temperature: float) -> str | None:
+        ...  # pragma: no cover
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable backend identifier."""
+        ...
+
+
+class LlamaServerBackend(Backend):
+    """Local llama.cpp server (fastest, needs compiled binary + GPU)."""
+
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self.model_path = MODEL_UD if Path(MODEL_UD).exists() else MODEL_Q4
+        if not Path(self.model_path).exists():
+            p(f"ERROR: Model not found at {self.model_path}", file=sys.stderr)
+            sys.exit(1)
+
+    @property
+    def name(self) -> str:
+        return f"llama-server ({Path(self.model_path).name})"
+
+    def chat(self, messages: list[dict], temperature: float) -> str | None:
+        with self._lock:
+            payload = {
+                "model": "Qwen3.6-27B-MTP",
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 8192,
+                "stream": False,
+            }
+
+        data = json.dumps(payload).encode("utf-8")
+        req = Request(
+            f"{CONFIG['server']}/v1/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        raw = ""
+        try:
+            with urlopen(req, timeout=300) as resp:
+                raw = resp.read().decode("utf-8")
+                result = json.loads(raw)
+                return result["choices"][0]["message"]["content"]
+        except TimeoutError:
+            p(f"  ERROR: llama-server: TIMEOUT (300s), temp={temperature}", file=sys.stderr)
+            dlog(f"llama-server: TIMEOUT")
+            return None
+        except URLError as e:
+            p(f"  ERROR: llama-server: CONNECTION FAILED: {e}, temp={temperature}", file=sys.stderr)
+            dlog(f"llama-server: CONNECTION_FAILED")
+            return None
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            preview = raw[:300].replace("\n", "\\n")
+            p(f"  ERROR: llama-server: PARSE ERROR ({type(e).__name__}: {e}), temp={temperature}", file=sys.stderr)
+            dlog(preview)
+            return None
+
+    def start_server(self, workers: int):
+        """Start llama-server subprocess."""
+        global _server_proc
+
+        variant = "UD-Q4_K_XL" if "UD" in self.model_path else "Q4_K_M"
+        p(f"Model:       {Path(self.model_path).name} ({variant})")
+
+        cmd = [
+            LLAMA_SERVER, "-m", self.model_path, "--alias", "Qwen3.6-27B-MTP",
+            "-ngl", "99", "--flash-attn", "on", "--cont-batching",
+            "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
+            "--ctx-size", "65536", "--parallel", str(workers),
+            "--temp", "0.7", "--top-p", "0.80", "--top-k", "20",
+            "--min-p", "0.0",
+            # MTP speculative decoding (tuned from Windows config)
+            "--spec-type", "draft-mtp", "--spec-draft-n-max", "4",
+            "--spec-draft-n-min", "1", "--spec-draft-p-split", "0.10",
+            "--spec-draft-p-min", "0.05", "--spec-draft-ngl", "all",
+            "--spec-draft-type-k", "q4_0", "--spec-draft-type-v", "q4_0",
+            "--cache-reuse", "256",
+        ]
+
+        p(f"Starting llama-server (--parallel {workers})...")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _server_proc = proc
+
+        for i in range(120):
+            try:
+                req = Request(f"{CONFIG['server']}/health")
+                with urlopen(req, timeout=3) as resp:
+                    if resp.status == 200:
+                        p(f"Server ready after {i + 1}s ({workers} slots)")
+                        time.sleep(2)
+                        return
+            except Exception:
+                pass
+            if (i + 1) % 30 == 0:
+                p(f"  ... waiting for server ({i + 1}s)")
+            time.sleep(1)
+
+        p("ERROR: Server failed to start within 120s", file=sys.stderr)
+        proc.kill()
         sys.exit(1)
 
-    variant = "UD-Q4_K_XL" if "UD" in model else "Q4_K_M"
-    p(f"Model:       {Path(model).name} ({variant})")
-
-    cmd = [
-        LLAMA_SERVER, "-m", model, "--alias", "Qwen3.6-27B-MTP",
-        "-ngl", "99", "--flash-attn", "on", "--cont-batching",
-        "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
-        "--ctx-size", "65536", "--parallel", str(parallel),
-        "--temp", "0.7", "--top-p", "0.80", "--top-k", "20",
-        "--min-p", "0.0",
-        # MTP speculative decoding (tuned from Windows config)
-        "--spec-type", "draft-mtp", "--spec-draft-n-max", "4",
-        "--spec-draft-n-min", "1", "--spec-draft-p-split", "0.10",
-        "--spec-draft-p-min", "0.05", "--spec-draft-ngl", "all",
-        "--spec-draft-type-k", "q4_0", "--spec-draft-type-v", "q4_0",
-        "--cache-reuse", "256",
-        "--host", host, "--port", str(port),
-    ]
-
-    p(f"Starting llama-server (--parallel {parallel})...")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    global _server_proc
-    _server_proc = proc
-
-    # Wait for server to be ready
-    url = f"http://{host}:{port}"
-    for i in range(120):
-        try:
-            req = Request(f"{url}/health")
-            with urlopen(req, timeout=3) as resp:
-                if resp.status == 200:
-                    p(f"Server ready after {i + 1}s ({parallel} slots)")
-                    time.sleep(2)  # let model warm up
-                    return proc
-        except Exception:
-            pass
-        if (i + 1) % 30 == 0:
-            p(f"  ... waiting for server ({i + 1}s)")
-        time.sleep(1)
-
-    p("ERROR: Server failed to start within 120s", file=sys.stderr)
-    proc.kill()
-    sys.exit(1)
+    def stop_server(self):
+        """Kill the llama-server subprocess."""
+        global _server_proc
+        if _server_proc and _server_proc.poll() is None:
+            p("Stopping llama-server...")
+            _server_proc.terminate()
+            try:
+                _server_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _server_proc.kill()
+                _server_proc.wait()
+            p("Server stopped.")
 
 
-def stop_llama_server():
-    """Kill the llama-server subprocess."""
-    global _server_proc
-    if _server_proc and _server_proc.poll() is None:
-        p("Stopping llama-server...")
-        _server_proc.terminate()
-        try:
-            _server_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _server_proc.kill()
-            _server_proc.wait()
-        p("Server stopped.")
+class HuggingFaceBackend(Backend):
+    """HuggingFace Serverless Inference API (free tier, no GPU needed).
+
+    Model: Qwen2.5-72B-Instruct — best quality available on free serverless tier.
+    Rate limit: ~3 requests/min on free tier. Retries with exponential backoff.
+    """
+
+    HF_API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-72B-Instruct"
+    MAX_RETRIES = 6
+    BASE_DELAY = 10  # seconds, doubled each retry (capped at 60s)
+
+    _lock = threading.Lock()
+    _last_request_time: float = 0  # track rate limiting between threads
+
+    def __init__(self):
+        self.token = os.environ.get("HF_TOKEN", "")
+        if not self.token:
+            p("WARNING: HF_TOKEN env var not set. Using anonymous access (may fail).",
+              file=sys.stderr)
+
+    @property
+    def name(self) -> str:
+        return "HuggingFace Serverless API (Qwen2.5-72B-Instruct)"
+
+    def chat(self, messages: list[dict], temperature: float) -> str | None:
+        with self._lock:
+            # Rate limit: respect ~3 req/min free tier
+            elapsed_since_last = time.time() - self._last_request_time
+            if elapsed_since_last < 20:  # ~3 req/min margin
+                wait = 20 - elapsed_since_last + random.uniform(1, 5)
+                p(f"  [rate limit] waiting {wait:.1f}s...", file=sys.stderr)
+                time.sleep(wait)
+            self._last_request_time = time.time()
+
+        for attempt in range(self.MAX_RETRIES):
+            payload = {
+                "model": "Qwen/Qwen2.5-72B-Instruct",
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 8192,
+                "stream": False,
+            }
+
+            data = json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            req = Request(self.HF_API_URL, data=data, headers=headers, method="POST")
+
+            try:
+                with urlopen(req, timeout=300) as resp:
+                    raw = resp.read().decode("utf-8")
+                    result = json.loads(raw)
+
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content")
+                    if not content:
+                        dlog(f"hf: empty response (attempt {attempt+1}): {raw[:300]}")
+                        raise ValueError("Empty content in response")
+
+                    return content.strip()
+
+            except URLError as e:
+                status = getattr(e, "code", None)
+                if status == 503 and attempt < self.MAX_RETRIES - 1:
+                    # Model loading / overloaded — retry with backoff
+                    delay = min(2 ** (attempt + 2), 60) + random.uniform(0, 5)
+                    p(f"  [HF 503] model loading/overloaded, retrying in {delay:.1f}s "
+                      f"(attempt {attempt+1}/{self.MAX_RETRIES})", file=sys.stderr)
+                    time.sleep(delay)
+                    continue
+                msg = f"hf: CONNECTION FAILED ({status}): {e}"
+                p(f"  ERROR: {msg}", file=sys.stderr)
+                dlog(msg)
+                return None
+            except (TimeoutError, ValueError) as e:
+                if attempt < self.MAX_RETRIES - 1:
+                    delay = min(2 ** (attempt + 2), 60) + random.uniform(0, 5)
+                    p(f"  [HF retry] {type(e).__name__}: {e}, retrying in {delay:.1f}s "
+                      f"(attempt {attempt+1}/{self.MAX_RETRIES})", file=sys.stderr)
+                    time.sleep(delay)
+                    continue
+                msg = f"hf: {type(e).__name__} ({e}), temp={temperature}"
+                p(f"  ERROR: {msg}", file=sys.stderr)
+                dlog(msg)
+                return None
 
 
 # System prompt (authoritative Verse knowledge)
@@ -228,67 +380,24 @@ def load_seeds(path: Path, max_samples: int = 200) -> list[dict]:
     return selected
 
 
-def api_chat(messages: list[dict], temperature: float, max_tokens: int = 2048) -> str | None:
-    """Call llama.cpp OpenAI-compatible chat endpoint."""
-    payload = {
-        "model": "Qwen3.6-27B-MTP",
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": 8192,  # Increased from 4096 to allow full generation of complex Verse prompts
-        "stream": False,
-    }
+# Active backend (set in main() after auto-detection or --backend flag)
+_backend_instance: Backend | None = None
 
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(
-        f"{CONFIG['server']}/v1/chat/completions",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
 
-    raw = ""
-    try:
-        with urlopen(req, timeout=300) as resp:
-            raw = resp.read().decode("utf-8")
-            result = json.loads(raw)
+def backend_chat(messages: list[dict], temperature: float) -> str | None:
+    """Call the active backend's chat method. Used by all generation strategies."""
+    assert _backend_instance is not None, "Backend not initialized — check main() setup"
+    result = _backend_instance.chat(messages, temperature)
 
-            # Log the full response structure for diagnosis (first time only)
-            if not hasattr(api_chat, "_logged_structure"):
-                api_chat._logged_structure = True
-                dlog(f"api_chat: response keys={list(result.keys())}")
-                choices = result.get("choices", [])
-                dlog(f"api_chat: {len(choices)} choice(s)")
-                if choices:
-                    msg = choices[0].get("message", {})
-                    dlog(f"api_chat: message keys={list(msg.keys())}")
-                    usage = result.get("usage", {})
-                    dlog(f"api_chat: usage={usage}")
+    # Debug logging (thread-safe via dlog's own lock)
+    if result:
+        preview = result[:200].replace("\n", "\\n")
+        tail = result[-150:].replace("\n", "\\n") if len(result) > 350 else ""
+        dlog(f"chat OK: {len(result)} chars, backend={_backend_instance.name}, preview=...{preview}")
+    else:
+        dlog(f"chat FAILED (returned None), backend={_backend_instance.name}, temp={temperature}")
 
-            content = result["choices"][0]["message"]["content"]
-            if not content or len(content.strip()) == 0:
-                # Log the raw JSON so we can see what's actually in there
-                dlog(f"api_chat: EMPTY response (temp={temperature}), full_json={raw[:500]}")
-            else:
-                preview = content[:200].replace("\n", "\\n")
-                tail = content[-150:].replace("\n", "\\n") if len(content) > 350 else ""
-                dlog(f"api_chat OK: {len(content)} chars, temp={temperature}, preview=...{preview}")
-            return content
-    except TimeoutError:
-        msg = f"api_chat: TIMEOUT (300s), temp={temperature}"
-        p(f"  ERROR: {msg}", file=sys.stderr)
-        dlog(msg)
-        return None
-    except URLError as e:
-        msg = f"api_chat: CONNECTION FAILED: {e}, temp={temperature}"
-        p(f"  ERROR: {msg}", file=sys.stderr)
-        dlog(msg)
-        return None
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        preview = raw[:300].replace("\n", "\\n")
-        msg = f"api_chat: PARSE ERROR ({type(e).__name__}: {e}), temp={temperature}, raw=...{preview}"
-        p(f"  ERROR: Response parse error: {e}", file=sys.stderr)
-        dlog(msg)
-        return None
+    return result
 
 
 def pick_few_shot(seeds: list[dict], n: int = 3) -> str:
@@ -324,7 +433,7 @@ def generate_self_instruct(seeds: list[dict], temperature: float, batch_size: in
         },
     ]
 
-    result = api_chat(messages, temperature, max_tokens=2048)  # self_instruct: batch of 5 samples
+    result = backend_chat(messages, temperature)  # self_instruct: batch of 5 samples
     if not result:
         return []
 
@@ -368,7 +477,7 @@ def generate_evol_instruct(seeds: list[dict], temperature: float) -> list[dict]:
         },
     ]
 
-    result = api_chat(messages, temperature, max_tokens=1024)  # evol_instruct: 3 evolved versions
+    result = backend_chat(messages, temperature)  # evol_instruct: 3 evolved versions
     if not result:
         return []
 
@@ -427,7 +536,7 @@ def generate_nl_to_code(seeds: list[dict], temperature: float) -> list[dict]:
         },
     ]
 
-    result = api_chat(messages, temperature, max_tokens=1536)  # nl_to_code: single code sample
+    result = backend_chat(messages, temperature)  # nl_to_code: single code sample
     if not result:
         return []
 
@@ -465,7 +574,7 @@ def generate_code_explanation(seeds: list[dict], temperature: float) -> list[dic
         },
     ]
 
-    result = api_chat(messages, temperature, max_tokens=2048)
+    result = backend_chat(messages, temperature)
     if not result:
         return []
 
@@ -595,7 +704,32 @@ def write_final(samples: list[dict], path: Path):
 
 # Main generation loop
 
+# Backend configuration (used by LlamaServerBackend to find the server URL)
 CONFIG = {"server": os.environ.get("LLAMA_HOST", "http://127.0.0.1:18080")}
+
+
+def _select_backend(args) -> tuple[Backend, str]:
+    """Determine which backend to use based on --backend flag or auto-detection."""
+    if hasattr(args, "backend") and args.backend:
+        backend_name = args.backend.lower()
+        p(f"Using explicit backend: {backend_name}")
+        if backend_name == "huggingface":
+            return HuggingFaceBackend(), "huggingface"
+        elif backend_name in ("llama-server", "local"):
+            return LlamaServerBackend(), "llama-server"
+        else:
+            p(f"ERROR: Unknown backend '{backend_name}'. Use 'llama-server' or 'huggingface'.",
+              file=sys.stderr)
+            sys.exit(1)
+
+    # Auto-detect: prefer llama-server if available, otherwise HF
+    if Path(MODEL_UD).exists() or Path(MODEL_Q4).exists():
+        p("Auto-detected: local model found, using llama-server backend")
+        return LlamaServerBackend(), "llama-server"
+    else:
+        p("No local model found. Falling back to HuggingFace Serverless API.")
+        p("Set HF_TOKEN env var for higher rate limits, or run locally with a GGUF model.")
+        return HuggingFaceBackend(), "huggingface"
 
 
 def main():
@@ -606,6 +740,10 @@ def main():
     parser.add_argument("--temps", default="0.3,0.5,0.7,0.9", help="Comma-separated temperatures")
     parser.add_argument("--workers", type=int, default=1, help="Parallel workers (server --parallel)")
     parser.add_argument("--resume", action="store_true", help="Append to existing output instead of overwriting")
+    parser.add_argument("--backend",
+                        choices=["llama-server", "local", "huggingface"],
+                        default=None,
+                        help="Inference backend (auto-detect by default)")
     parser.add_argument("--llama-server", default=None, help="Path to llama-server binary")
     parser.add_argument("--model-q4", default=None, help="Path to Qwen3.6-27B-Q4_K_M.gguf")
     args = parser.parse_args()
@@ -620,19 +758,24 @@ def main():
         global MODEL_Q4
         MODEL_Q4 = args.model_q4
 
+    # Select and initialize backend
+    _backend_instance, backend_name = _select_backend(args)
+    p(f"Backend: {backend_name}")
+
     p(f"Temperatures: {temps}")
     p(f"Workers:      {args.workers} (server --parallel)")
     p(f"Target:       {target} samples")
     p()
 
-    # Start llama-server
-    host, port = "127.0.0.1", 18080
-    start_llama_server(host, port, args.workers)
+    # Start llama-server if using local backend
+    if isinstance(_backend_instance, LlamaServerBackend):
+        _backend_instance.start_server(args.workers)
 
     try:
         _run_generation(target, temps, args.workers, args.resume)
     finally:
-        stop_llama_server()
+        if isinstance(_backend_instance, LlamaServerBackend):
+            _backend_instance.stop_server()
 
 
 def _run_generation(target: int, temps: list[float], workers: int, resume: bool):
