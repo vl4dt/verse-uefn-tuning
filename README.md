@@ -30,41 +30,42 @@ Seed Data → Synthetic Generation → Quality Filtering → QLoRA Fine-tuning
 
 ### 1. Set up GPU runtime
 - Colab → Runtime → Change runtime type → **T4 GPU** (free) or A100/L4 (paid)
-- Minimum VRAM needed: ~18 GB for Q4_K_M quantization
 
-### 2. Clone and run setup
+### 2. Clone and install dependencies
 
 ```python
-# Cell 1 — Clone repo
+# Cell 1 — Clone repo + install deps
 !git clone https://github.com/YOUR_USERNAME/verse-uefn-tuning.git
 %cd verse-uefn-tuning
-
-# Cell 2 — Build llama.cpp + download model (~5 min)
-!bash setup_colab.sh
+!pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 -q
+!pip install -r requirements.txt -q
 ```
 
-### 3. Run synthetic generation
+### 3. Run synthetic generation (HuggingFace backend)
 
 ```python
-# Cell 3 — Generate 5000 samples (est. 30–60 min on T4, ~10 min on A100)
-!python3 scripts/generate_synthetic.py \
-    --llama-server llama.cpp/build/bin/llama-server \
-    --model-q4 models/Qwen3.6-27B-Q4_K_M.gguf \
-    --workers 4 \
-    --target-samples 5000
+# Generate 5000 samples (~30–60 min on T4, ~10 min on A100)
+import subprocess, os
+os.chdir('/content/verse-uefn-tuning')
+subprocess.run([
+    'python3', 'scripts/generate_synthetic.py',
+    '--backend', 'huggingface',
+    '--workers', str(os.cpu_count() or 2),
+    '--target-samples', '5000'
+], check=True)
 
 # Or resume an interrupted run:
-!python3 scripts/generate_synthetic.py --resume
+subprocess.run(['python3', 'scripts/generate_synthetic.py', '--resume'], check=True)
 ```
 
-Output: `data/seeds/synthetic_raw.jsonl` (Alpaca-format instruction-response pairs)
+Output: `output/synthetic_data.jsonl` (Alpaca-format instruction-response pairs)
 
 ---
 
 ## Architecture Details
 
-### Teacher Model: Qwen3.6-27B MTP
-The [Qwen3.6-27B-MTP](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) model uses **Multi-Token Prediction** speculative decoding baked into the GGUF — no extra config needed for ~1.4–2.2× faster inference.
+### Teacher Model: Qwen3.6-27B MTP (HuggingFace)
+The [Qwen3.6-27B-MTP](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) model is loaded via `transformers` + `accelerate`. The HuggingFace backend uses standard PyTorch inference — no separate server needed, no quantization required (full precision).
 
 ### Generation Strategies (4 methods, weighted sampling)
 
@@ -90,23 +91,19 @@ Each generation call includes 2–3 randomly sampled seeds from `unified_seeds.j
 
 ## Colab Configuration
 
-### llama.cpp Server Arguments (auto-applied by script)
-
-```bash
---n-gpu-layers 99 --flash-attn on --cont-batching \
---cache-type-k q4_0 --cache-type-v q4_0 \
---ctx-size 65536 --parallel <workers> \
---temp 0.7 --top-p 0.80 --top-k 20 \
---spec-type draft-mtp --spec-draft-n-max 4 \
---spec-draft-p-split 0.10
-```
+### HuggingFace Backend Notes
+- Uses `transformers` + `accelerate` — no separate server needed
+- Full precision (no quantization) — model loaded into GPU VRAM via PyTorch
+- Auto-selects GPU if available, falls back to CPU
 
 ### VRAM Requirements
 
-| GPU | Available VRAM | Quantization | Notes |
-|-----|---------------|--------------|-------|
-| T4 (free) | 16 GB | Q3_K_M / Q4_K_M (tight) | Use fewer parallel workers |
-| A100/L4 (paid) | 24 GB | Q4_K_M comfortable | Recommended for fastest generation |
+| GPU | Available VRAM | Notes |
+|-----|---------------|-------|
+| T4 (free) | 16 GB | Full precision ~52 GB won't fit — use `--max-workers 1` or switch to QLoRA fine-tuning later |
+| A100/L4 (paid) | 24–80 GB | Comfortable for full precision with multiple workers |
+
+> **Note:** The HuggingFace backend runs at full precision (~52 GB for Qwen3.6-27B). On T4 (16 GB), you'll need to use fewer workers or rely on CPU offloading via `accelerate`. For production generation, an A100 with 80 GB is recommended.
 
 ---
 
@@ -141,5 +138,4 @@ See `RESEARCH.md` Phase 4 for the full Unsloth training script and hyperparamete
 
 - [Book of Verse](https://verselang.github.io/book/) — Official language reference
 - [awesome-verse](https://github.com/spilth/awesome-verse) — Community resource list
-- [Qwen3.6-27B-MTP GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) — Teacher model quantization
-- [llama.cpp MTP guide](https://mer.vin/2026/05/run-qwen-3-6-mtp-in-llama-cpp-faster-local-inference-with-built-in-speculative-decoding/)
+- [Qwen3.6-27B-MTP](https://huggingface.co/Qwen/Qwen3.6-27B-MTP) — Teacher model (HuggingFace)

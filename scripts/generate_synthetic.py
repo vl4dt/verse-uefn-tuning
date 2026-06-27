@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """Synthetic Verse data generation.
 
-Supports two backends:
-  llama-server  – local llama.cpp (fastest, needs CUDA + compiled binary)
-  huggingface   – HF Serverless Inference API (free tier, no GPU needed)
+Two backends supported:
+  huggingface   – HF Serverless API or local transformers (default, no setup)
+  llama-server  – local llama.cpp binary (fastest, needs CUDA + compiled binary)
 
-Auto-detects: if llama-server is available locally it uses that; otherwise
-falls back to HuggingFace. Override with --backend llama-server|huggingface.
+Auto-detects: prefers local model if found; otherwise falls back to HuggingFace.
+Override with --backend huggingface|llama-server.
 
 Usage:
-    # Local llama-server backend (fastest, needs CUDA + compiled binary):
-    python3 scripts/generate_synthetic.py --target-samples 2000 --workers 4
+    # Colab / cloud (HuggingFace backend — default):
+    python3 scripts/generate_synthetic.py --target-samples 5000 --workers 2
 
-    # Colab / no-GPU (free tier HuggingFace API, Qwen2.5-72B-Instruct):
-    export HF_TOKEN="hf_..."          # optional, higher rate limit than anon
-    python3 scripts/generate_synthetic.py --target-samples 1000  # auto-detects HF
+    # Local GPU server (fastest, needs compiled llama.cpp binary):
+    python3 scripts/generate_synthetic.py --backend llama-server --workers 8
 
 Output: data/seeds/synthetic_raw.jsonl (Alpaca format)
 Checkpoint: saved after every batch so interrupted runs don't lose data.
