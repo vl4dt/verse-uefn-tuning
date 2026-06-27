@@ -707,28 +707,32 @@ def write_final(samples: list[dict], path: Path):
 CONFIG = {"server": os.environ.get("LLAMA_HOST", "http://127.0.0.1:18080")}
 
 
-def _select_backend(args) -> tuple[Backend, str]:
-    """Determine which backend to use based on --backend flag or auto-detection."""
-    if hasattr(args, "backend") and args.backend:
-        backend_name = args.backend.lower()
-        p(f"Using explicit backend: {backend_name}")
-        if backend_name == "huggingface":
-            return HuggingFaceBackend(), "huggingface"
-        elif backend_name in ("llama-server", "local"):
-            return LlamaServerBackend(), "llama-server"
-        else:
-            p(f"ERROR: Unknown backend '{backend_name}'. Use 'llama-server' or 'huggingface'.",
-              file=sys.stderr)
-            sys.exit(1)
-
-    # Auto-detect: prefer llama-server if available, otherwise HF
-    if Path(MODEL_UD).exists() or Path(MODEL_Q4).exists():
-        p("Auto-detected: local model found, using llama-server backend")
-        return LlamaServerBackend(), "llama-server"
-    else:
-        p("No local model found. Falling back to HuggingFace Serverless API.")
-        p("Set HF_TOKEN env var for higher rate limits, or run locally with a GGUF model.")
-        return HuggingFaceBackend(), "huggingface"
+def _check_hf_connectivity() -> bool:
+    """Test if HuggingFace API is reachable before starting generation."""
+    import socket
+    try:
+        # Try to resolve the hostname first
+        socket.setdefaulttimeout(10)
+        host = "api-inference.huggingface.co"
+        ip = socket.gethostbyname(host)
+        p(f"DNS resolution OK: {host} -> {ip}")
+        
+        # Try a quick HTTP check (just headers, don't send model data)
+        from urllib.request import urlopen, Request
+        req = Request("https://api-inference.huggingface.co/", method="HEAD")
+        with urlopen(req, timeout=10) as resp:
+            status = getattr(resp, "status", resp.getcode())
+            p(f"Connectivity check: OK (HTTP {status})")
+            return True
+    except socket.gaierror as e:
+        p(f"ERROR: Cannot resolve api-inference.huggingface.co (DNS failure)", file=sys.stderr)
+        p(f"  This usually means: network restriction, corporate proxy, or VPN blocking outbound traffic", file=sys.stderr)
+        p(f"  Try: use --backend llama-server with a local model, or check your Colab runtime's internet access", file=sys.stderr)
+        return False
+    except Exception as e:
+        p(f"ERROR: Cannot reach HuggingFace API: {e}", file=sys.stderr)
+        p(f"  Check your internet connection and proxy settings in Colab", file=sys.stderr)
+        return False
 
 
 def main():
@@ -761,6 +765,11 @@ def main():
     global _backend_instance
     _backend_instance, backend_name = _select_backend(args)
     p(f"Backend: {backend_name}")
+
+    # Check connectivity for cloud backends before starting workers
+    if isinstance(_backend_instance, HuggingFaceBackend):
+        if not _check_hf_connectivity():
+            sys.exit(1)
 
     p(f"Temperatures: {temps}")
     p(f"Workers:      {args.workers} (server --parallel)")
